@@ -1,0 +1,216 @@
+name: Windows RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  remote-windows:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+
+      - name: Configure RDP
+        shell: powershell
+        run: |
+          Write-Host "Configurando RDP..."
+
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0 `
+            -Force
+
+          Set-Service `
+            -Name "TermService" `
+            -StartupType Automatic
+
+          Start-Service -Name "TermService"
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop"
+
+          Write-Host "RDP configurado."
+
+      - name: Create RDP Account
+        shell: powershell
+        run: |
+
+          $Username = "RemoteUser"
+
+          # Senha simples e compatível com RDP/Windows
+          $Password = "RdpWin2026!X7q"
+
+          # Remove conta antiga, caso exista
+          $oldUser = Get-LocalUser `
+            -Name $Username `
+            -ErrorAction SilentlyContinue
+
+          if ($oldUser) {
+            Remove-LocalUser `
+              -Name $Username
+          }
+
+          $SecurePassword = ConvertTo-SecureString `
+            $Password `
+            -AsPlainText `
+            -Force
+
+          New-LocalUser `
+            -Name $Username `
+            -Password $SecurePassword `
+            -Description "GitHub RDP User" `
+            -PasswordNeverExpires `
+            -AccountNeverExpires
+
+          # Adiciona aos grupos necessários
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $Username
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member $Username
+
+          # Garante que a conta está habilitada
+          Enable-LocalUser `
+            -Name $Username
+
+          # Salva as informações no ambiente do workflow
+          "RDP_USER=$Username" >> $env:GITHUB_ENV
+          "RDP_PASSWORD=$Password" >> $env:GITHUB_ENV
+
+          Write-Host ""
+          Write-Host "================================"
+          Write-Host "USUARIO: .\$Username"
+          Write-Host "SENHA:   $Password"
+          Write-Host "================================"
+          Write-Host ""
+
+      - name: Verify User
+        shell: powershell
+        run: |
+
+          $user = Get-LocalUser `
+            -Name "RemoteUser"
+
+          if (!$user) {
+            Write-Error "A conta não foi criada."
+            exit 1
+          }
+
+          if ($user.Enabled -ne $true) {
+            Write-Error "A conta está desativada."
+            exit 1
+          }
+
+          Write-Host "Conta encontrada:"
+          Write-Host $user.Name
+          Write-Host "Enabled: $($user.Enabled)"
+
+          Write-Host ""
+          Write-Host "Grupos da conta:"
+          net user RemoteUser
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+
+          $Installer = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $Installer
+
+          Start-Process `
+            msiexec.exe `
+            -ArgumentList "/i `"$Installer`" /quiet /norestart" `
+            -Wait
+
+          Remove-Item `
+            $Installer `
+            -Force
+
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+
+          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (!(Test-Path $Tailscale)) {
+            Write-Error "Tailscale não encontrado."
+            exit 1
+          }
+
+          & $Tailscale up `
+            --authkey="$env:TAILSCALE_AUTH_KEY" `
+            --hostname="github-rdp-$env:GITHUB_RUN_ID"
+
+          Start-Sleep -Seconds 10
+
+          $IP = (& $Tailscale ip -4).Trim()
+
+          if (!$IP) {
+            Write-Error "IP Tailscale não encontrado."
+            exit 1
+          }
+
+          "TAILSCALE_IP=$IP" >> $env:GITHUB_ENV
+
+          Write-Host "Tailscale IP: $IP"
+
+      - name: Verify RDP Port
+        shell: powershell
+        run: |
+
+          Start-Sleep -Seconds 5
+
+          $Test = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          Write-Host "IP: $env:TAILSCALE_IP"
+          Write-Host "Porta 3389: $($Test.TcpTestSucceeded)"
+
+          if (!$Test.TcpTestSucceeded) {
+            Write-Error "A porta 3389 não está acessível."
+            exit 1
+          }
+
+      - name: Connection Information
+        shell: powershell
+        run: |
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "             RDP DISPONIVEL"
+          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "ENDERECO:"
+          Write-Host "$env:TAILSCALE_IP"
+          Write-Host ""
+          Write-Host "USUARIO:"
+          Write-Host ".\RemoteUser"
+          Write-Host ""
+          Write-Host "SENHA:"
+          Write-Host "$env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "PORTA:"
+          Write-Host "3389"
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host ""
+
+      - name: Keep RDP Online
+        shell: powershell
+        run: |
+
+          while ($true) {
+
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP ativo."
+
+            Start-Sleep -Seconds 300
+          }
